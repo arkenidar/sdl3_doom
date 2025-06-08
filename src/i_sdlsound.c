@@ -24,8 +24,10 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
-#include "SDL3/SDL.h"
-#include "SDL3_mixer/SDL_mixer.h"
+// #include "SDL3/SDL.h"
+// #include "SDL3_mixer/SDL_mixer.h"
+#include <SDL3/SDL.h>
+#include <SDL3_mixer/SDL_mixer.h>
 
 #ifdef HAVE_LIBSAMPLERATE
 #include <samplerate.h>
