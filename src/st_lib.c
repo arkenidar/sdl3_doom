@@ -225,8 +225,31 @@ STlib_updateMultIcon
 
 	    V_CopyRect(x, y-ST_Y, st_backing_screen, w, h, x, y);
 	}
-	V_DrawPatch(mi->x, mi->y, mi->p[*mi->inum]);
-	mi->oldinum = *mi->inum;
+    
+    // hack: don't draw the icon if it is one of these
+    // special icons that are not drawn (they cause a crash
+    // if drawn, because they are not valid patches).
+    switch (*mi->inum)
+    {
+    case 257:
+    case 16777473:
+    case 65537:
+    case 256:
+        return; // hack
+        break;
+    default:
+        break;
+    }
+
+    patch_t* patch = mi->p[*mi->inum];
+    if (patch == NULL)
+    {
+        // debugging message
+        I_Error("updateMultIcon: patch %d is NULL", *mi->inum);
+        return;
+    }
+    V_DrawPatch(mi->x, mi->y, patch);
+    mi->oldinum = *mi->inum;
     }
 }
 
