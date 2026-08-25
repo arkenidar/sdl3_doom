@@ -51,14 +51,21 @@ typedef struct allocated_sound_s allocated_sound_t;
 struct allocated_sound_s
 {
     sfxinfo_t *sfxinfo;
-    Mix_Chunk chunk;
+    // SDL3_mixer has no Mix_Chunk; sound data is wrapped in a MIX_Audio
+    // that points (without copying) at the buffer following this struct.
+    MIX_Audio *audio;
+    byte *abuf;
+    Uint32 alen;
     int use_count;
     allocated_sound_t *prev, *next;
 };
 
-static boolean setpanning_workaround = false;
-
 static boolean sound_initialized = false;
+
+// The mixer, and one track per sound channel. SDL3_mixer has no global
+// channel array any more; a "channel" is just a MIX_Track.
+static MIX_Mixer *sfx_mixer = NULL;
+static MIX_Track *channel_tracks[NUM_CHANNELS];
 
 static sfxinfo_t *channels_playing[NUM_CHANNELS];
 
@@ -143,7 +150,15 @@ static void FreeAllocatedSound(allocated_sound_t *snd)
 
     // Keep track of the amount of allocated sound data:
 
-    allocated_sounds_size -= snd->chunk.alen;
+    allocated_sounds_size -= snd->alen;
+
+    // The MIX_Audio references the buffer that follows this struct, so it
+    // must be destroyed before the memory is released.
+
+    if (snd->audio != NULL)
+    {
+        MIX_DestroyAudio(snd->audio);
+    }
 
     free(snd);
 }
@@ -201,9 +216,10 @@ static void ReserveCacheSpace(size_t len)
 
 // Allocate a block for a new sound effect.
 
-static Mix_Chunk *AllocateSound(sfxinfo_t *sfxinfo, size_t len)
+static allocated_sound_t *AllocateSound(sfxinfo_t *sfxinfo, size_t len)
 {
     allocated_sound_t *snd;
+    SDL_AudioSpec spec;
 
     // Keep allocated sounds within the cache size.
 
@@ -226,12 +242,28 @@ static Mix_Chunk *AllocateSound(sfxinfo_t *sfxinfo, size_t len)
 
     } while (snd == NULL);
 
-    // Skip past the chunk structure for the audio buffer
+    // Skip past the header structure for the audio buffer
 
-    snd->chunk.abuf = (byte *) (snd + 1);
-    snd->chunk.alen = len;
-    snd->chunk.allocated = 1;
-    snd->chunk.volume = MIX_MAX_VOLUME;
+    snd->abuf = (byte *) (snd + 1);
+    snd->alen = len;
+
+    // Sound data is always expanded to the mixer format (stereo 16-bit at
+    // the mixer sample rate) by ExpandSoundData(), so describe it as such.
+    // MIX_LoadRawAudioNoCopy() borrows the buffer rather than copying it,
+    // matching the old Mix_Chunk behaviour of pointing at our own memory.
+
+    spec.format = SDL_AUDIO_S16;
+    spec.channels = 2;
+    spec.freq = mixer_freq;
+
+    snd->audio = MIX_LoadRawAudioNoCopy(sfx_mixer, snd->abuf, len, &spec,
+                                        false);
+
+    if (snd->audio == NULL)
+    {
+        free(snd);
+        return NULL;
+    }
 
     snd->sfxinfo = sfxinfo;
     snd->use_count = 0;
@@ -246,7 +278,7 @@ static Mix_Chunk *AllocateSound(sfxinfo_t *sfxinfo, size_t len)
 
     AllocatedSoundLink(snd);
 
-    return &snd->chunk;
+    return snd;
 }
 
 // Lock a sound, to indicate that it may not be freed.
@@ -294,6 +326,16 @@ static void ReleaseSoundOnChannel(int channel)
     }
 
     channels_playing[channel] = NULL;
+
+    // Drop the track's reference to the sound data. MIX_Audio is
+    // reference-counted and our PCM buffer is only borrowed (see
+    // MIX_LoadRawAudioNoCopy() in AllocateSound), so the track has to let go
+    // of it before the sound can be evicted from the cache and free()d.
+
+    if (channel_tracks[channel] != NULL)
+    {
+        MIX_SetTrackAudio(channel_tracks[channel], NULL);
+    }
 
     UnlockAllocatedSound(sfxinfo->driver_data);
 }
@@ -344,7 +386,7 @@ static boolean ExpandSoundData_SRC(sfxinfo_t *sfxinfo,
     uint32_t alen;
     int retn;
     int16_t *expanded;
-    Mix_Chunk *chunk;
+    allocated_sound_t *chunk;
 
     src_data.input_frames = length;
     src_data.data_in = malloc(length * sizeof(float));
@@ -533,7 +575,7 @@ static boolean ExpandSoundData_SDL(sfxinfo_t *sfxinfo,
                                    int samplerate,
                                    int length)
 {
-    Mix_Chunk *chunk;
+    allocated_sound_t *chunk;
     uint32_t expanded_length;
  
     // Calculate the length of the expanded version of the sample.    
@@ -800,6 +842,7 @@ static int I_SDL_GetSfxLumpNum(sfxinfo_t *sfx)
 static void I_SDL_UpdateSoundParams(int handle, int vol, int sep)
 {
     int left, right;
+    MIX_StereoGains gains;
 
     if (!sound_initialized || handle < 0 || handle >= NUM_CHANNELS)
     {
@@ -814,17 +857,13 @@ static void I_SDL_UpdateSoundParams(int handle, int vol, int sep)
     if (right < 0) right = 0;
     else if (right > 255) right = 255;
 
-    // SDL_mixer version 1.2.8 and earlier has a bug in the Mix_SetPanning
-    // function.  A workaround is to call Mix_UnregisterAllEffects for
-    // the channel before calling it.  This is undesirable as it may lead
-    // to the channel volumes resetting briefly.
+    // SDL2_mixer's Mix_SetPanning() took 0-255 per channel; SDL3_mixer's
+    // MIX_SetTrackStereo() takes a gain where 1.0f is full volume.
 
-    if (setpanning_workaround)
-    {
-        Mix_UnregisterAllEffects(handle);
-    }
+    gains.left = (float) left / 255.0f;
+    gains.right = (float) right / 255.0f;
 
-    Mix_SetPanning(handle, left, right);
+    MIX_SetTrackStereo(channel_tracks[handle], &gains);
 }
 
 //
@@ -865,7 +904,12 @@ static int I_SDL_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep)
 
     // play sound
 
-    Mix_PlayChannelTimed(channel, &snd->chunk, 0, -1);
+    if (!MIX_SetTrackAudio(channel_tracks[channel], snd->audio)
+     || !MIX_PlayTrack(channel_tracks[channel], 0))
+    {
+        UnlockAllocatedSound(snd);
+        return -1;
+    }
 
     channels_playing[channel] = sfxinfo;
 
@@ -883,7 +927,7 @@ static void I_SDL_StopSound(int handle)
         return;
     }
 
-    Mix_HaltChannel(handle);
+    MIX_StopTrack(channel_tracks[handle], 0);
 
     // Sound data is no longer needed; release the
     // sound data being used for this channel
@@ -899,7 +943,7 @@ static boolean I_SDL_SoundIsPlaying(int handle)
         return false;
     }
 
-    return Mix_Playing(handle);
+    return MIX_TrackPlaying(channel_tracks[handle]);
 }
 
 // 
@@ -925,13 +969,28 @@ static void I_SDL_UpdateSound(void)
 }
 
 static void I_SDL_ShutdownSound(void)
-{    
+{
+    int i;
+
     if (!sound_initialized)
     {
         return;
     }
 
-    Mix_CloseAudio();
+    for (i = 0; i < NUM_CHANNELS; ++i)
+    {
+        if (channel_tracks[i] != NULL)
+        {
+            MIX_StopTrack(channel_tracks[i], 0);
+            MIX_DestroyTrack(channel_tracks[i]);
+            channel_tracks[i] = NULL;
+        }
+    }
+
+    // Destroying a device mixer also closes the audio device.
+    MIX_DestroyMixer(sfx_mixer);
+    sfx_mixer = NULL;
+    MIX_Quit();
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
 
     sound_initialized = false;
@@ -977,22 +1036,54 @@ static boolean I_SDL_InitSound(boolean _use_sfx_prefix)
         channels_playing[i] = NULL;
     }
 
+    for (i=0; i<NUM_CHANNELS; ++i)
+    {
+        channel_tracks[i] = NULL;
+    }
+
     if (!SDL_Init(SDL_INIT_AUDIO))
     {
         fprintf(stderr, "Unable to set up sound.\n");
         return false;
     }
-    const SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, GetSliceSize()};
 
-    if (!Mix_OpenAudio(0, &spec))
+    // SDL_AudioSpec in SDL3 is {format, channels, freq}; the mixing buffer
+    // size is no longer part of it, so snd_maxslicetime_ms is applied
+    // through the SDL3 audio hint instead.
+    const SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, snd_samplerate};
+    char slicebuf[16];
+
+    M_snprintf(slicebuf, sizeof(slicebuf), "%i", GetSliceSize());
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, slicebuf);
+
+    if (!MIX_Init())
     {
         fprintf(stderr, "Error initialising SDL_mixer: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        return false;
+    }
+
+    sfx_mixer = MIX_CreateMixerDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                                      &spec);
+
+    if (sfx_mixer == NULL)
+    {
+        fprintf(stderr, "Error initialising SDL_mixer: %s\n", SDL_GetError());
+        MIX_Quit();
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
         return false;
     }
 
     ExpandSoundData = ExpandSoundData_SDL;
 
-    Mix_QuerySpec(&mixer_freq, &mixer_format, &mixer_channels);
+    {
+        SDL_AudioSpec mixer_spec;
+
+        MIX_GetMixerFormat(sfx_mixer, &mixer_spec);
+        mixer_freq = mixer_spec.freq;
+        mixer_format = mixer_spec.format;
+        mixer_channels = mixer_spec.channels;
+    }
 
 #ifdef HAVE_LIBSAMPLERATE
     if (use_libsamplerate != 0)
@@ -1014,29 +1105,20 @@ static boolean I_SDL_InitSound(boolean _use_sfx_prefix)
     }
 #endif
 
-    // SDL_mixer version 1.2.8 and earlier has a bug in the Mix_SetPanning
-    // function that can cause the game to lock up.  If we're using an old
-    // version, we need to apply a workaround.  But the workaround has its
-    // own drawbacks ...
+    // SDL2_mixer had a fixed pool of channels allocated with
+    // Mix_AllocateChannels(); in SDL3_mixer each channel is a MIX_Track.
 
+    for (i=0; i<NUM_CHANNELS; ++i)
     {
-        int v = SDL_VERSIONNUM(SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_MICRO_VERSION);
+        channel_tracks[i] = MIX_CreateTrack(sfx_mixer);
 
-        if (v <= SDL_VERSIONNUM(1, 2, 8))
+        if (channel_tracks[i] == NULL)
         {
-            setpanning_workaround = true;
-            fprintf(stderr, "\n"
-              "ATTENTION: You are using an old version of SDL_mixer!\n"
-              "           This version has a bug that may cause "
-                          "your sound to stutter.\n"
-              "           Please upgrade to a newer version!\n"
-              "\n");
+            fprintf(stderr, "Error creating mixer track: %s\n",
+                    SDL_GetError());
+            return false;
         }
     }
-
-    Mix_AllocateChannels(NUM_CHANNELS);
-
-    Mix_PauseAudio(0);
 
     sound_initialized = true;
 

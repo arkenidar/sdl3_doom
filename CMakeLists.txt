@@ -21,4 +21,4 @@ add_executable(sdl3-doom src/i_main.c src/dummy.c src/am_map.c src/doomdef.c src
  src/r_sky.c src/r_things.c src/sha1.c src/sounds.c src/statdump.c src/st_lib.c  src/st_stuff.c  src/s_sound.c  src/tables.c  
  src/v_video.c  src/wi_stuff.c  src/w_checksum.c  src/w_file.c  src/w_main.c  src/w_wad.c  src/z_zone.c  src/w_file_stdc.c )
 
-target_link_libraries(sdl3-doom PRIVATE ${SDL3_LIBRARIES} ${SDL3_mixer_LIBRARIES})
+target_link_libraries(sdl3-doom PRIVATE SDL3::SDL3 SDL3_mixer::SDL3_mixer)
